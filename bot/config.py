@@ -20,6 +20,7 @@ class Config:
     retention_days: int = 14
     idle_timeout_minutes: int = 60
     admins: tuple[str, ...] = tuple()
+    system_prompt_path: str = "bot/system_prompt.txt"
 
 
 def load_config() -> Config:
@@ -29,6 +30,7 @@ def load_config() -> Config:
     logs_dir = os.getenv("LOGS_DIR", "logs")
     retention_days = int(os.getenv("RETENTION_DAYS", "14"))
     idle_timeout_minutes = int(os.getenv("IDLE_TIMEOUT_MINUTES", "60"))
+    system_prompt_path = os.getenv("SYSTEM_PROMPT_PATH", "bot/system_prompt.txt")
     admin_ids_raw = os.getenv("ADMIN_CHAT_IDS", "").strip()
     admins: tuple[str, ...] = tuple(
         [a for a in admin_ids_raw.split(",") if a.strip()] if admin_ids_raw else []
@@ -41,6 +43,7 @@ def load_config() -> Config:
         retention_days=retention_days,
         idle_timeout_minutes=idle_timeout_minutes,
         admins=admins,
+        system_prompt_path=system_prompt_path,
     )
 
 

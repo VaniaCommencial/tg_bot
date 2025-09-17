@@ -157,8 +157,19 @@ class BotHandlers:
                 ),
             )
 
-            # Инициализация сессии модели
-            chat = self.gemini.start_chat()
+            # Инициализация сессии модели с историей: первый ход = картинка+подпись
+            # Это позволит продолжать диалог одним и тем же chat объектом
+            chat = self.gemini.start_chat(
+                history=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"mime_type": mime, "data": image_bytes},
+                            caption,
+                        ],
+                    }
+                ]
+            )
             session = ActiveSession(
                 dialog_id=dialog_id,
                 gemini_chat=chat,
@@ -170,7 +181,19 @@ class BotHandlers:
 
             # Отправляем в модель мультимодально
             await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-            answer = await self.gemini.generate_with_image_and_text(image_bytes=image_bytes, mime_type=mime, text=caption)
+            try:
+            answer, _ = await self.gemini.generate_with_image_and_text(image_bytes=image_bytes, mime_type=mime, text=caption)
+            except RuntimeError as e:
+                code = str(e)
+                if code == "gemini_region_blocked":
+                    await msg.reply_text(
+                        "К сожалению, доступ к модели ограничен по региону. Попробуйте позже или через другой регион."
+                    )
+                else:
+                    await msg.reply_text(
+                        "Не удалось получить ответ от модели. Попробуйте повторить запрос позже."
+                    )
+                return
 
             # Запись сообщений
             session.message_seq += 1
@@ -218,8 +241,14 @@ class BotHandlers:
             def _send() -> Any:
                 return session.gemini_chat.send_message(prompt)
 
-            resp = await context.application.run_in_threadpool(_send)
-            text = getattr(resp, "text", None) or "(нет ответа)"
+            try:
+                resp = await context.application.run_in_threadpool(_send)
+                text = getattr(resp, "text", None) or "(нет ответа)"
+            except Exception:
+                await msg.reply_text(
+                    "Не удалось получить ответ от модели. Попробуйте повторить запрос позже."
+                )
+                return
 
             session.message_seq += 1
             self.store.append_message(
