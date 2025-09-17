@@ -58,13 +58,38 @@ class BotHandlers:
             "/history [N] — показать последние N диалогов (по умолчанию 5).\n"
             "/dialog <id> [full] — показать выжимку или полный диалог.\n"
             "/clear [current|all] — очистка диалога или всей истории.\n"
+            "/stats [me|global] — статистика. global — только для админов.\n"
         )
         await update.effective_message.reply_text(text)
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        u = update.effective_user
+        if not u:
+            return
+        args = context.args or []
+        scope = args[0].lower() if args else "me"
+        if scope == "global":
+            if str(u.id) not in self.admins:
+                await update.effective_message.reply_text("Недостаточно прав.")
+                return
+            stats = self.store.global_stats()
+            await update.effective_message.reply_text(
+                f"Пользователей: {stats['users']}, Диалогов: {stats['dialogs']}, Запросов: {stats['requests']}"
+            )
+        else:
+            stats = self.store.user_stats(u.id)
+            last = stats.get("last_active_at")
+            last_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "—"
+            await update.effective_message.reply_text(
+                f"Ваши статистика — Диалогов: {stats['dialogs']}, Запросов: {stats['requests']}, Последняя активность: {last_str}"
+            )
 
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         u = update.effective_user
         if not u:
             return
+        # prune old on history
+        self.store.prune_old(self.retention_days)
         args = context.args or []
         try:
             limit = int(args[0]) if args else 5
@@ -85,6 +110,7 @@ class BotHandlers:
         u = update.effective_user
         if not u:
             return
+        self.store.prune_old(self.retention_days)
         if not context.args:
             await update.effective_message.reply_text("Укажите id диалога: /dialog <id> [full]")
             return
@@ -110,15 +136,34 @@ class BotHandlers:
             await update.effective_message.reply_text(f"{dialog_id}: {title}")
 
     async def cmd_clear(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_message.reply_text(
-            "Очистка истории пока доступна вручную (будет добавлено позже)."
-        )
+        u = update.effective_user
+        if not u:
+            return
+        args = context.args or []
+        mode = args[0].lower() if args else "current"
+        if mode not in ("current", "all"):
+            await update.effective_message.reply_text("Использование: /clear [current|all]")
+            return
+        if mode == "current":
+            s = self.sessions.get(u.id)
+            if not s:
+                await update.effective_message.reply_text("Нет активного диалога.")
+                return
+            self.store.delete_dialog(u.id, s.dialog_id)
+            self.sessions.clear(u.id)
+            await update.effective_message.reply_text("Текущий диалог удален.")
+        else:
+            cnt = self.store.clear_all_dialogs(u.id)
+            self.sessions.clear(u.id)
+            await update.effective_message.reply_text(f"Удалено диалогов: {cnt}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         u = update.effective_user
         if not msg or not u:
             return
+        # prune old on each message
+        self.store.prune_old(self.retention_days)
         self.store.init_user_if_needed(u.id, u.username, u.first_name, u.last_name)
 
         # Фото
@@ -157,32 +202,13 @@ class BotHandlers:
                 ),
             )
 
-            # Инициализация сессии модели с историей: первый ход = картинка+подпись
-            # Это позволит продолжать диалог одним и тем же chat объектом
-            chat = self.gemini.start_chat(
-                history=[
-                    {
-                        "role": "user",
-                        "parts": [
-                            {"mime_type": mime, "data": image_bytes},
-                            caption,
-                        ],
-                    }
-                ]
-            )
-            session = ActiveSession(
-                dialog_id=dialog_id,
-                gemini_chat=chat,
-                last_activity_at=time.time(),
-                last_image_meta=image_meta,
-                message_seq=0,
-            )
-            self.sessions.set(u.id, session)
-
-            # Отправляем в модель мультимодально
-            await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+            # Инициализация чата и первый ответ внутри одного и того же chat (с учетом system prompt)
             try:
-            answer, _ = await self.gemini.generate_with_image_and_text(image_bytes=image_bytes, mime_type=mime, text=caption)
+                chat, answer = await self.gemini.start_chat_and_answer_first(
+                    image_bytes=image_bytes,
+                    mime_type=mime,
+                    text=caption,
+                )
             except RuntimeError as e:
                 code = str(e)
                 if code == "gemini_region_blocked":
@@ -194,6 +220,17 @@ class BotHandlers:
                         "Не удалось получить ответ от модели. Попробуйте повторить запрос позже."
                     )
                 return
+            session = ActiveSession(
+                dialog_id=dialog_id,
+                gemini_chat=chat,
+                last_activity_at=time.time(),
+                last_image_meta=image_meta,
+                message_seq=0,
+            )
+            self.sessions.set(u.id, session)
+
+            # Ответ уже получен внутри чата; просто отправим typing и продолжим сохранение
+            await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
 
             # Запись сообщений
             session.message_seq += 1
@@ -237,17 +274,19 @@ class BotHandlers:
                 return
             prompt = msg.text
             await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-            # Используем gemini chat для продолжения контекста
-            def _send() -> Any:
-                return session.gemini_chat.send_message(prompt)
-
+            # Используем gemini chat для продолжения контекста (с ретраями)
             try:
-                resp = await context.application.run_in_threadpool(_send)
-                text = getattr(resp, "text", None) or "(нет ответа)"
-            except Exception:
-                await msg.reply_text(
-                    "Не удалось получить ответ от модели. Попробуйте повторить запрос позже."
-                )
+                text = await self.gemini.send_chat_message(session.gemini_chat, prompt)
+            except RuntimeError as e:
+                code = str(e)
+                if code == "gemini_region_blocked":
+                    await msg.reply_text(
+                        "К сожалению, доступ к модели ограничен по региону. Попробуйте позже или через другой регион."
+                    )
+                else:
+                    await msg.reply_text(
+                        "Не удалось получить ответ от модели. Попробуйте повторить запрос позже."
+                    )
                 return
 
             session.message_seq += 1

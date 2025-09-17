@@ -41,6 +41,7 @@ async def create_application():
     app.add_handler(CommandHandler("history", handlers.cmd_history))
     app.add_handler(CommandHandler("dialog", handlers.cmd_dialog))
     app.add_handler(CommandHandler("clear", handlers.cmd_clear))
+    app.add_handler(CommandHandler("stats", handlers.cmd_stats))
 
     app.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), handlers.handle_message))
 

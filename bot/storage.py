@@ -167,6 +167,12 @@ class JsonStore:
         msgs.append(message)
         data["messages"] = msgs
         self._atomic_write(path, data)
+        # update user stats message count
+        u = self.load_user(chat_id)
+        if u:
+            u.setdefault("stats", {})
+            u["stats"]["total_requests"] = u["stats"].get("total_requests", 0) + 1
+            self.save_user(u)
 
     def close_dialog(self, chat_id: int, dialog_id: str) -> None:
         path = self._dialog_path(chat_id, dialog_id)
@@ -183,5 +189,96 @@ class JsonStore:
             return None
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
+
+    def delete_dialog(self, chat_id: int, dialog_id: str) -> bool:
+        # remove dialog file and index entry
+        path = self._dialog_path(chat_id, dialog_id)
+        existed = path.exists()
+        if existed:
+            try:
+                path.unlink()
+            except Exception:
+                existed = False
+        u = self.load_user(chat_id)
+        if u is not None:
+            idx = [e for e in u.get("dialogs_index", []) if e.get("dialog_id") != dialog_id]
+            u["dialogs_index"] = idx
+            self.save_user(u)
+        return existed
+
+    def clear_all_dialogs(self, chat_id: int) -> int:
+        # delete all dialogs for user
+        ddir = self.dialogs_dir / str(chat_id)
+        count = 0
+        if ddir.exists():
+            for p in ddir.glob("*.json"):
+                try:
+                    p.unlink()
+                    count += 1
+                except Exception:
+                    pass
+        u = self.load_user(chat_id)
+        if u is not None:
+            u["dialogs_index"] = []
+            self.save_user(u)
+        return count
+
+    def prune_old(self, days: int) -> int:
+        # remove dialogs older than days across all users
+        cutoff = time.time() - days * 86400
+        removed = 0
+        for chat_dir in self.dialogs_dir.glob("*"):
+            if not chat_dir.is_dir():
+                continue
+            chat_id = int(chat_dir.name) if chat_dir.name.isdigit() else None
+            for p in chat_dir.glob("*.json"):
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    started = float(data.get("started_at", 0))
+                except Exception:
+                    started = 0
+                if started and started < cutoff:
+                    try:
+                        dialog_id = data.get("dialog_id")
+                        p.unlink()
+                        removed += 1
+                        if chat_id is not None and dialog_id:
+                            u = self.load_user(chat_id)
+                            if u:
+                                idx = [e for e in u.get("dialogs_index", []) if e.get("dialog_id") != dialog_id]
+                                u["dialogs_index"] = idx
+                                self.save_user(u)
+                    except Exception:
+                        pass
+        return removed
+
+    def user_stats(self, chat_id: int) -> Dict[str, Any]:
+        u = self.load_user(chat_id) or {}
+        idx = u.get("dialogs_index", [])
+        return {
+            "dialogs": len(idx),
+            "requests": (u.get("stats", {}).get("total_requests", 0)),
+            "last_active_at": u.get("stats", {}).get("last_active_at"),
+        }
+
+    def global_stats(self) -> Dict[str, Any]:
+        users = list(self.users_dir.glob("*.json"))
+        total_users = len(users)
+        total_dialogs = 0
+        total_requests = 0
+        for p in users:
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    u = json.load(f)
+                total_dialogs += len(u.get("dialogs_index", []))
+                total_requests += u.get("stats", {}).get("total_requests", 0)
+            except Exception:
+                pass
+        return {
+            "users": total_users,
+            "dialogs": total_dialogs,
+            "requests": total_requests,
+        }
 
 
